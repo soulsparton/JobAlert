@@ -1,0 +1,17 @@
+{
+  "name": "freelancing",
+  "version": "1.0.0",
+  "main": "test_scraping.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.106.2",
+    "dotenv": "^17.4.2",
+    "playwright": "^1.60.0"
+  }
+}
