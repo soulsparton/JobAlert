@@ -14,10 +14,12 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
-// CO-ORDINATES FOR TARGET SEARCH AREA
-const SEARCH_LAT = parseFloat(process.env.SEARCH_LAT) || 43.6532;
-const SEARCH_LNG = parseFloat(process.env.SEARCH_LNG) || -79.3832;
-const SEARCH_RADIUS_KM = parseInt(process.env.SEARCH_RADIUS_KM, 10) || 100;
+// TARGET SCANS SPECIFIC TO ONTARIO DEMANDS (100km covers entire regions comprehensively)
+const SCAN_LOCATIONS = [
+  { name: 'Brampton (GTA)', lat: 43.7315, lng: -79.7624, radius: 100 },
+  { name: 'Ottawa', lat: 45.4215, lng: -75.6972, radius: 100 }
+];
+
 
 // Cloudflare Workers Proxy Gateway URL (Fallback to direct querying if empty)
 const PROXY_URL = process.env.PROXY_URL || 'https://hiring.amazon.ca/graphql';
@@ -131,9 +133,9 @@ async function sendAlert(job) {
 }
 
 // ==========================================
-// CORE MONITORING DAEMON
+// HELPER: FETCH ACTIVE JOBS BY LOCATION
 // ==========================================
-async function monitorJobs() {
+async function fetchJobsForLocation(location) {
   const payload = {
     operationName: "searchJobCardsByLocation",
     variables: {
@@ -142,10 +144,10 @@ async function monitorJobs() {
         country: "Canada",
         pageSize: 100,
         geoQueryClause: {
-          lat: SEARCH_LAT,
-          lng: SEARCH_LNG,
+          lat: location.lat,
+          lng: location.lng,
           unit: "km",
-          distance: SEARCH_RADIUS_KM
+          distance: location.radius
         },
         dateFilters: [{
           key: "firstDayOnSite",
@@ -179,22 +181,50 @@ async function monitorJobs() {
     'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
   };
 
-  try {
-    // Queries via your Cloudflare Worker proxy
-    const response = await fetch(PROXY_URL, {
-      method: 'POST',
-      headers: headers,
-      body: JSON.stringify(payload)
-    });
-    
-    if (!response.ok) {
-      throw new Error(`HTTP Error ${response.status} ${response.statusText}`);
-    }
+  const response = await fetch(PROXY_URL, {
+    method: 'POST',
+    headers: headers,
+    body: JSON.stringify(payload)
+  });
+  
+  if (!response.ok) {
+    throw new Error(`HTTP Error ${response.status} ${response.statusText}`);
+  }
 
-    const resJson = await response.json();
-    const jobCards = resJson.data?.searchJobCardsByLocation?.jobCards || [];
+  const resJson = await response.json();
+  return resJson.data?.searchJobCardsByLocation?.jobCards || [];
+}
+
+// ==========================================
+// CORE MONITORING DAEMON (Deduplicated Multi-Region)
+// ==========================================
+async function monitorJobs() {
+  try {
+    // Run Brampton and Ottawa queries in parallel
+    const scanPromises = SCAN_LOCATIONS.map(async (loc) => {
+      try {
+        const jobs = await fetchJobsForLocation(loc);
+        console.log(`[${new Date().toLocaleTimeString()}] Scanned ${loc.name}. Found ${jobs.length} active jobs.`);
+        return jobs;
+      } catch (err) {
+        console.error(`[ERROR] Failed to scan ${loc.name}:`, err.message);
+        return [];
+      }
+    });
+
+    const results = await Promise.all(scanPromises);
     
-    console.log(`[${new Date().toLocaleTimeString()}] Checked Amazon. Active jobs found: ${jobCards.length}`);
+    // Merge all jobs from all active scans
+    const rawJobCards = results.flat();
+    
+    // Deduplicate by jobId to handle potential geographic overlaps
+    const jobCardsMap = new Map();
+    for (const job of rawJobCards) {
+      jobCardsMap.set(job.jobId, job);
+    }
+    const jobCards = Array.from(jobCardsMap.values());
+
+    console.log(`[${new Date().toLocaleTimeString()}] Total unique active jobs across Brampton & Ottawa: ${jobCards.length}`);
 
     // Process all active jobs returned from the server
     for (const job of jobCards) {
@@ -260,7 +290,7 @@ async function monitorJobs() {
     if (!dbError && dbActiveJobs) {
       for (const dbJob of dbActiveJobs) {
         if (!activeJobIds.includes(dbJob.id)) {
-          // Job has disappeared from Amazon's site -> Mark as filled!
+          // Job has disappeared from both target regions -> Mark as filled!
           const { error: patchError } = await supabase
             .from('amazon_jobs')
             .update({ 
@@ -280,6 +310,7 @@ async function monitorJobs() {
     console.error(`[${new Date().toLocaleTimeString()}] Query Error:`, error.message);
   }
 }
+
 
 // ==========================================
 // START THE MONITOR SERVICE & PORT BINDER
