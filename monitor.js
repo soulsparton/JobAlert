@@ -133,6 +133,70 @@ async function sendAlert(job) {
 }
 
 // ==========================================
+// SYSTEM ALERTS (Sends warning if API fails/changes)
+// ==========================================
+let lastSystemAlertTime = 0;
+const SYSTEM_ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes cooldown to avoid spamming
+
+async function sendSystemAlert(errorMsg) {
+  const now = Date.now();
+  if (now - lastSystemAlertTime < SYSTEM_ALERT_COOLDOWN_MS) {
+    return; // Skip sending to avoid spamming
+  }
+  lastSystemAlertTime = now;
+
+  console.error(`\n⚠️ [SYSTEM ERROR ALERT]: ${errorMsg}`);
+
+  // 1. TELEGRAM ERROR ALERT
+  if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+    const telegramMessage = `⚠️ *AMAZON MONITOR CRITICAL ALERT*\n\n` +
+      `The job monitor has encountered a critical query or connection error. Amazon may have updated their API structure or the proxy is down.\n\n` +
+      `*Error Details:* \`${errorMsg}\`\n\n` +
+      `_Action Required: Check the server logs and verify if Amazon changed its GraphQL endpoint or HAR structure._`;
+
+    const telegramUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    try {
+      await fetch(telegramUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: TELEGRAM_CHAT_ID,
+          text: telegramMessage,
+          parse_mode: 'Markdown'
+        })
+      });
+    } catch (err) {
+      console.error('Failed to send Telegram system alert:', err.message);
+    }
+  }
+
+  // 2. DISCORD ERROR ALERT
+  if (DISCORD_WEBHOOK_URL) {
+    const discordPayload = {
+      embeds: [{
+        title: `⚠️ AMAZON MONITOR CRITICAL ALERT`,
+        description: `The job monitor has encountered a critical error. Amazon may have updated their API or the proxy is down.`,
+        color: 16711680, // Red
+        fields: [
+          { name: "Error Message", value: `\`\`\`${errorMsg}\`\`\``, inline: false }
+        ],
+        timestamp: new Date().toISOString()
+      }]
+    };
+    try {
+      await fetch(DISCORD_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(discordPayload)
+      });
+    } catch (err) {
+      console.error('Failed to send Discord system alert:', err.message);
+    }
+  }
+}
+
+
+// ==========================================
 // HELPER: FETCH ACTIVE JOBS BY LOCATION
 // ==========================================
 async function fetchJobsForLocation(location) {
@@ -208,6 +272,7 @@ async function monitorJobs() {
         return jobs;
       } catch (err) {
         console.error(`[ERROR] Failed to scan ${loc.name}:`, err.message);
+        await sendSystemAlert(`Failed to scan ${loc.name}: ${err.message}`);
         return [];
       }
     });
@@ -308,6 +373,7 @@ async function monitorJobs() {
 
   } catch (error) {
     console.error(`[${new Date().toLocaleTimeString()}] Query Error:`, error.message);
+    await sendSystemAlert(`Global Query Error: ${error.message}`);
   }
 }
 
