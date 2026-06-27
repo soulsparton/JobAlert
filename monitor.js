@@ -75,7 +75,7 @@ async function sendAlert(job) {
       `[Apply to Job Now](${jobUrl})`;
 
     const telegramUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    
+
     try {
       const response = await fetch(telegramUrl, {
         method: 'POST',
@@ -238,11 +238,14 @@ async function fetchJobsForLocation(location) {
   };
 
   const headers = {
+    'accept': '*/*',
     'content-type': 'application/json',
     'country': 'Canada',
+    'iscanary': 'false',
     'authorization': 'Bearer Status|unauthenticated|Session|',
+    'origin': 'https://hiring.amazon.ca',
     'referer': 'https://hiring.amazon.ca/app',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36'
   };
 
   const response = await fetch(PROXY_URL, {
@@ -250,7 +253,7 @@ async function fetchJobsForLocation(location) {
     headers: headers,
     body: JSON.stringify(payload)
   });
-  
+
   if (!response.ok) {
     throw new Error(`HTTP Error ${response.status} ${response.statusText}`);
   }
@@ -278,10 +281,10 @@ async function monitorJobs() {
     });
 
     const results = await Promise.all(scanPromises);
-    
+
     // Merge all jobs from all active scans
     const rawJobCards = results.flat();
-    
+
     // Deduplicate by jobId to handle potential geographic overlaps
     const jobCardsMap = new Map();
     for (const job of rawJobCards) {
@@ -294,10 +297,10 @@ async function monitorJobs() {
     // Process all active jobs returned from the server
     for (const job of jobCards) {
       const isNew = !seenJobs.has(job.jobId);
-      
+
       if (isNew) {
         seenJobs.add(job.jobId);
-        
+
         // Define the row payload (Perfect mapping of all Amazon fields)
         const newJobRow = {
           id: job.jobId,
@@ -330,8 +333,8 @@ async function monitorJobs() {
         // If it already exists, update its status back to 'active' and refresh details
         await supabase
           .from('amazon_jobs')
-          .update({ 
-            status: 'active', 
+          .update({
+            status: 'active',
             last_seen_at: new Date().toISOString(),
             schedule_count: job.scheduleCount,
             pay_rate_min: job.totalPayRateMin,
@@ -345,7 +348,7 @@ async function monitorJobs() {
 
     // Check for "filled" jobs:
     const activeJobIds = jobCards.map(j => j.jobId);
-    
+
     // Fetch all active job records currently inside Supabase
     const { data: dbActiveJobs, error: dbError } = await supabase
       .from('amazon_jobs')
@@ -358,9 +361,9 @@ async function monitorJobs() {
           // Job has disappeared from both target regions -> Mark as filled!
           const { error: patchError } = await supabase
             .from('amazon_jobs')
-            .update({ 
-              status: 'filled', 
-              filled_at: new Date().toISOString() 
+            .update({
+              status: 'filled',
+              filled_at: new Date().toISOString()
             })
             .eq('id', dbJob.id);
 
@@ -385,7 +388,7 @@ async function start() {
   console.log('==========================================');
   console.log('  AMAZON CANADA JOB MONITOR (SUPABASE PRO) ');
   console.log('==========================================');
-  
+
   // Wait to load seen job list from Supabase
   await loadSeenJobsFromSupabase();
 
@@ -398,7 +401,7 @@ async function start() {
   // Bind to HTTP port (Required for Render to deploy successfully)
   const http = require('http');
   const PORT = process.env.PORT || 8080;
-  
+
   http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('Amazon Canada Job Monitor is running live!');
