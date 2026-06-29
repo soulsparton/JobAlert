@@ -212,11 +212,7 @@ async function fetchJobsForLocation(location) {
           lng: location.lng,
           unit: "km",
           distance: location.radius
-        },
-        dateFilters: [{
-          key: "firstDayOnSite",
-          range: { startDate: new Date().toISOString().split('T')[0] }
-        }]
+        }
       }
     },
     query: `query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
