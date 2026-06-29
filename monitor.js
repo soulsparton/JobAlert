@@ -5,6 +5,7 @@ const { createClient } = require('@supabase/supabase-js');
 // CONFIGURATION (Loaded from Environment)
 // ==========================================
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS, 10) || 30000;
+const HEARTBEAT_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -20,7 +21,6 @@ const SCAN_LOCATIONS = [
   { name: 'Ottawa', lat: 45.4215, lng: -75.6972, radius: 100 }
 ];
 
-
 // Cloudflare Workers Proxy Gateway URL (Fallback to direct querying if empty)
 const PROXY_URL = process.env.PROXY_URL || 'https://hiring.amazon.ca/graphql';
 
@@ -35,6 +35,15 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 let seenJobs = new Set();
+let isPolling = false; // Prevent concurrent poll cycles
+
+
+// ==========================================
+// HELPERS
+// ==========================================
+function indianTime() {
+  return new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+}
 
 // Fetch previously recorded job IDs from Supabase to prevent duplicate alerts on restarts
 async function loadSeenJobsFromSupabase() {
@@ -44,26 +53,41 @@ async function loadSeenJobsFromSupabase() {
       .from('amazon_jobs')
       .select('id');
 
-    if (error) {
-      throw error;
-    }
+    if (error) throw error;
 
     if (data) {
       seenJobs = new Set(data.map(j => j.id));
-      console.log(`[SYSTEM] Successfully loaded ${seenJobs.size} previously tracked job IDs from Supabase.`);
+      console.log(`[SYSTEM] Loaded ${seenJobs.size} previously tracked job IDs from Supabase.`);
     }
   } catch (err) {
-    console.error('[SYSTEM] Error loading jobs from Supabase. Ensure table "amazon_jobs" exists in your DB.', err.message);
+    console.error('[SYSTEM] Error loading jobs from Supabase:', err.message);
   }
 }
+
+// Writes one row to monitor_heartbeat table every 24h to prevent Supabase free tier pause
+async function pingSupabaseHeartbeat() {
+  try {
+    const { error } = await supabase
+      .from('monitor_heartbeat')
+      .upsert({ id: 1, last_ping_at: new Date().toISOString() }, { onConflict: 'id' });
+
+    if (error) {
+      console.error('[HEARTBEAT] Failed to ping Supabase:', error.message);
+    } else {
+      console.log(`[HEARTBEAT] Supabase keep-alive ping sent at ${indianTime()}`);
+    }
+  } catch (err) {
+    console.error('[HEARTBEAT] Unexpected error:', err.message);
+  }
+}
+
 
 // ==========================================
 // NOTIFICATION CHANNELS (Using Native Fetch)
 // ==========================================
 async function sendAlert(job) {
-  console.log(`\n🚨 [ALERT] NEW JOB POSTING FOUND: ${job.title} at ${job.location_name} ($${job.pay_rate_min}-$${job.pay_rate_max}/hr)`);
-
   const jobUrl = `https://hiring.amazon.ca/app#/jobDetail?jobId=${job.id}`;
+  console.log(`\n🚨 [ALERT] NEW JOB FOUND: ${job.title} at ${job.location_name} ($${job.pay_rate_min}-$${job.pay_rate_max}/hr)`);
 
   // 1. TELEGRAM ALERT
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
@@ -74,10 +98,8 @@ async function sendAlert(job) {
       `*Shifts Available:* ${job.schedule_count}\n\n` +
       `[Apply to Job Now](${jobUrl})`;
 
-    const telegramUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-
     try {
-      const response = await fetch(telegramUrl, {
+      const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -121,9 +143,7 @@ async function sendAlert(job) {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(discordPayload)
       });
-      if (response.ok) {
-        console.log('  [ALERT] Discord notification sent successfully.');
-      } else {
+      if (!response.ok) {
         console.error(`  [ERROR] Discord webhook failed: ${response.status} ${response.statusText}`);
       }
     } catch (err) {
@@ -133,35 +153,29 @@ async function sendAlert(job) {
 }
 
 // ==========================================
-// SYSTEM ALERTS (Sends warning if API fails/changes)
+// SYSTEM ALERTS
 // ==========================================
 let lastSystemAlertTime = 0;
-const SYSTEM_ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes cooldown to avoid spamming
+const SYSTEM_ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes cooldown
 
 async function sendSystemAlert(errorMsg) {
   const now = Date.now();
-  if (now - lastSystemAlertTime < SYSTEM_ALERT_COOLDOWN_MS) {
-    return; // Skip sending to avoid spamming
-  }
+  if (now - lastSystemAlertTime < SYSTEM_ALERT_COOLDOWN_MS) return;
   lastSystemAlertTime = now;
 
   console.error(`\n⚠️ [SYSTEM ERROR ALERT]: ${errorMsg}`);
 
-  // 1. TELEGRAM ERROR ALERT
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
-    const telegramMessage = `⚠️ *AMAZON MONITOR CRITICAL ALERT*\n\n` +
-      `The job monitor has encountered a critical query or connection error. Amazon may have updated their API structure or the proxy is down.\n\n` +
-      `*Error Details:* \`${errorMsg}\`\n\n` +
-      `_Action Required: Check the server logs and verify if Amazon changed its GraphQL endpoint or HAR structure._`;
-
-    const telegramUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
     try {
-      await fetch(telegramUrl, {
+      await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           chat_id: TELEGRAM_CHAT_ID,
-          text: telegramMessage,
+          text: `⚠️ *AMAZON MONITOR CRITICAL ALERT*\n\n` +
+            `The monitor has encountered an error.\n\n` +
+            `*Error:* \`${errorMsg}\`\n\n` +
+            `_Action Required: Check the server logs._`,
           parse_mode: 'Markdown'
         })
       });
@@ -170,24 +184,20 @@ async function sendSystemAlert(errorMsg) {
     }
   }
 
-  // 2. DISCORD ERROR ALERT
   if (DISCORD_WEBHOOK_URL) {
-    const discordPayload = {
-      embeds: [{
-        title: `⚠️ AMAZON MONITOR CRITICAL ALERT`,
-        description: `The job monitor has encountered a critical error. Amazon may have updated their API or the proxy is down.`,
-        color: 16711680, // Red
-        fields: [
-          { name: "Error Message", value: `\`\`\`${errorMsg}\`\`\``, inline: false }
-        ],
-        timestamp: new Date().toISOString()
-      }]
-    };
     try {
       await fetch(DISCORD_WEBHOOK_URL, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(discordPayload)
+        body: JSON.stringify({
+          embeds: [{
+            title: `⚠️ AMAZON MONITOR CRITICAL ALERT`,
+            description: `The monitor has encountered a critical error.`,
+            color: 16711680,
+            fields: [{ name: "Error Message", value: `\`\`\`${errorMsg}\`\`\``, inline: false }],
+            timestamp: new Date().toISOString()
+          }]
+        })
       });
     } catch (err) {
       console.error('Failed to send Discord system alert:', err.message);
@@ -199,7 +209,7 @@ async function sendSystemAlert(errorMsg) {
 // ==========================================
 // HELPER: FETCH ACTIVE JOBS BY LOCATION
 // ==========================================
-async function fetchJobsForLocation(location) {
+async function fetchJobsForLocation(location, signal) {
   const payload = {
     operationName: "searchJobCardsByLocation",
     variables: {
@@ -246,8 +256,9 @@ async function fetchJobsForLocation(location) {
 
   const response = await fetch(PROXY_URL, {
     method: 'POST',
-    headers: headers,
-    body: JSON.stringify(payload)
+    headers,
+    body: JSON.stringify(payload),
+    signal // abort signal for timeout
   });
 
   if (!response.ok) {
@@ -258,16 +269,28 @@ async function fetchJobsForLocation(location) {
   return resJson.data?.searchJobCardsByLocation?.jobCards || [];
 }
 
+
 // ==========================================
-// CORE MONITORING DAEMON (Deduplicated Multi-Region)
+// CORE MONITORING DAEMON
 // ==========================================
 async function monitorJobs() {
+  // Prevent concurrent poll cycles (if previous poll is still running, skip)
+  if (isPolling) {
+    console.log(`[${indianTime()}] Previous poll still running, skipping this cycle.`);
+    return;
+  }
+  isPolling = true;
+
+  // Hard timeout: abort all fetches after 25 seconds
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 25000);
+
   try {
-    // Run Brampton and Ottawa queries in parallel
+    // 1. Run Brampton and Ottawa queries in parallel
     const scanPromises = SCAN_LOCATIONS.map(async (loc) => {
       try {
-        const jobs = await fetchJobsForLocation(loc);
-        console.log(`[${new Date().toLocaleTimeString()}] Scanned ${loc.name}. Found ${jobs.length} active jobs.`);
+        const jobs = await fetchJobsForLocation(loc, controller.signal);
+        console.log(`[${indianTime()}] Scanned ${loc.name}. Found ${jobs.length} active jobs.`);
         return jobs;
       } catch (err) {
         console.error(`[ERROR] Failed to scan ${loc.name}:`, err.message);
@@ -277,102 +300,66 @@ async function monitorJobs() {
     });
 
     const results = await Promise.all(scanPromises);
+    clearTimeout(timeout);
 
-    // Merge all jobs from all active scans
-    const rawJobCards = results.flat();
+    // 2. Deduplicate by jobId (Brampton 100km and Ottawa 100km may overlap)
+    const jobMap = new Map(results.flat().map(j => [j.jobId, j]));
+    const jobCards = Array.from(jobMap.values());
 
-    // Deduplicate by jobId to handle potential geographic overlaps
-    const jobCardsMap = new Map();
-    for (const job of rawJobCards) {
-      jobCardsMap.set(job.jobId, job);
-    }
-    const jobCards = Array.from(jobCardsMap.values());
+    console.log(`[${indianTime()}] Total unique active jobs across Brampton & Ottawa: ${jobCards.length}`);
 
-    console.log(`[${new Date().toLocaleTimeString()}] Total unique active jobs across Brampton & Ottawa: ${jobCards.length}`);
+    // 3. Find genuinely new jobs
+    const newJobs = jobCards.filter(job => !seenJobs.has(job.jobId));
 
-    // Process all active jobs returned from the server
-    for (const job of jobCards) {
-      const isNew = !seenJobs.has(job.jobId);
-
-      if (isNew) {
-        seenJobs.add(job.jobId);
-
-        // Define the row payload (Perfect mapping of all Amazon fields)
-        const newJobRow = {
-          id: job.jobId,
-          title: job.jobTitle,
-          location_name: job.locationName,
-          city: job.city,
-          state: job.state,
-          postal_code: job.postalCode,
-          employment_type: job.employmentTypeL10N,
-          pay_rate_min: job.totalPayRateMin,
-          pay_rate_max: job.totalPayRateMax,
-          schedule_count: job.scheduleCount,
-          status: 'active',
-          last_seen_at: new Date().toISOString()
-        };
-
-        // Insert into Supabase
-        const { error } = await supabase
-          .from('amazon_jobs')
-          .insert([newJobRow]);
-
-        if (error) {
-          console.error(`[SUPABASE ERROR] Failed to save job ${job.jobId}:`, error.message);
-        } else {
-          console.log(`[SUPABASE] Saved new job: ${job.jobId}`);
-          // Trigger the Telegram alert
-          await sendAlert(newJobRow);
-        }
-      } else {
-        // If it already exists, update its status back to 'active' and refresh details
-        await supabase
-          .from('amazon_jobs')
-          .update({
-            status: 'active',
-            last_seen_at: new Date().toISOString(),
-            schedule_count: job.scheduleCount,
-            pay_rate_min: job.totalPayRateMin,
-            pay_rate_max: job.totalPayRateMax,
-            employment_type: job.employmentTypeL10N,
-            postal_code: job.postalCode
-          })
-          .eq('id', job.jobId);
-      }
+    // 4. ALERT FIRST — do not wait for DB success to notify client
+    for (const job of newJobs) {
+      seenJobs.add(job.jobId); // Mark as seen immediately
+      const alertPayload = {
+        id: job.jobId,
+        title: job.jobTitle,
+        location_name: job.locationName,
+        city: job.city,
+        state: job.state,
+        pay_rate_min: job.totalPayRateMin,
+        pay_rate_max: job.totalPayRateMax,
+        schedule_count: job.scheduleCount
+      };
+      await sendAlert(alertPayload);
     }
 
-    // Check for "filled" jobs:
-    const activeJobIds = jobCards.map(j => j.jobId);
+    // 5. Batch upsert ALL seen jobs in ONE DB call (not N individual writes)
+    if (jobCards.length > 0) {
+      const rows = jobCards.map(job => ({
+        id: job.jobId,
+        title: job.jobTitle,
+        location_name: job.locationName,
+        city: job.city,
+        state: job.state,
+        postal_code: job.postalCode,
+        employment_type: job.employmentTypeL10N,
+        pay_rate_min: job.totalPayRateMin,
+        pay_rate_max: job.totalPayRateMax,
+        schedule_count: job.scheduleCount,
+        last_seen_at: new Date().toISOString()
+      }));
 
-    // Fetch all active job records currently inside Supabase
-    const { data: dbActiveJobs, error: dbError } = await supabase
-      .from('amazon_jobs')
-      .select('id, title')
-      .eq('status', 'active');
+      const { error } = await supabase
+        .from('amazon_jobs')
+        .upsert(rows, { onConflict: 'id' });
 
-    if (!dbError && dbActiveJobs) {
-      for (const dbJob of dbActiveJobs) {
-        if (!activeJobIds.includes(dbJob.id)) {
-          // Job has disappeared from both target regions -> Mark as filled!
-          const { error: patchError } = await supabase
-            .from('amazon_jobs')
-            .update({
-              status: 'filled',
-              filled_at: new Date().toISOString()
-            })
-            .eq('id', dbJob.id);
-
-          if (!patchError) {
-            console.log(`[SYSTEM] Job ${dbJob.id} (${dbJob.title}) is now FILLED.`);
-          }
-        }
+      if (error) {
+        console.error('[SUPABASE ERROR] Batch upsert failed:', error.message);
+      } else if (newJobs.length > 0) {
+        console.log(`[SUPABASE] Saved ${newJobs.length} new job(s).`);
       }
     }
 
   } catch (error) {
-    console.error(`[${new Date().toLocaleTimeString()}] Query Error:`, error.message);
+    clearTimeout(timeout);
+    console.error(`[${indianTime()}] Query Error:`, error.message);
     await sendSystemAlert(`Global Query Error: ${error.message}`);
+  } finally {
+    isPolling = false;
   }
 }
 
@@ -380,31 +367,34 @@ async function monitorJobs() {
 // ==========================================
 // START THE MONITOR SERVICE & PORT BINDER
 // ==========================================
+const http = require('http');
+const PORT = process.env.PORT || 8080;
+
 async function start() {
   console.log('==========================================');
   console.log('  AMAZON CANADA JOB MONITOR (SUPABASE PRO) ');
   console.log('==========================================');
 
-  // Wait to load seen job list from Supabase
+  // Load seen jobs from Supabase on startup
   await loadSeenJobsFromSupabase();
 
-  // Run once immediately
-  monitorJobs();
+  // Run first poll immediately
+  await monitorJobs();
 
   // Poll at the specified interval
   setInterval(monitorJobs, POLL_INTERVAL_MS);
 
-  // Bind to HTTP port (Required for Render to deploy successfully)
-  const http = require('http');
-  const PORT = process.env.PORT || 8080;
+  // Heartbeat: ping Supabase once every 24h to prevent free tier project pause
+  await pingSupabaseHeartbeat();
+  setInterval(pingSupabaseHeartbeat, HEARTBEAT_INTERVAL_MS);
 
+  // Bind to HTTP port (Required for Render to deploy successfully)
   http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('Amazon Canada Job Monitor is running live!');
   }).listen(PORT, () => {
-    console.log(`[RENDER] Port binder active on port ${PORT}. Ready for cloud scaling.`);
+    console.log(`[RENDER] Port binder active on port ${PORT}.`);
   });
 }
 
 start();
-
